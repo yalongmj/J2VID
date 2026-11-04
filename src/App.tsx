@@ -155,7 +155,7 @@ export default function App() {
       }, setProcessingStep, fetch, setBatchProgress, partial => {
         if (audioResult) partial.subtitles = audioResult.subtitles;
         setAnnotationResult(partial);
-      });
+      }, {retries:autoFallback ? 2 : 0});
       if (audioResult) result.subtitles = audioResult.subtitles;
       setAnnotationResult(result);
       setActiveSceneIndex(0);

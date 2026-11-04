@@ -28,7 +28,7 @@ test('starting and segment backgrounds reach Gemini and OpenRouter generation an
         return Response.json({ error: { code: 404, message: 'Model unavailable' } }, { status: 404 });
       }
       const result = { video_duration: '00:00:05.000', suitability: { status: 'suitable', category: 'Documentary', confidence: 0.9, reason: 'Movement' },
-        scenes: [{ scene_id: 1, narrative_description: 'A person walks across the room.' }], subtitles: [], revised_description: 'A person enters the room.' };
+        scenes: [...new Set(Array.from(String(init?.body).matchAll(/scene #(\d+)/gi), match => Number(match[1])))].map(scene_id=>({scene_id,narrative_description:'A person walks across the room.'})), subtitles: [], revised_description: 'A person enters the room.' };
       return Response.json(url.includes('openrouter')
         ? { choices: [{ message: { content: JSON.stringify(result) } }] }
         : { candidates: [{ content: { role: 'model', parts: [{ text: JSON.stringify(result) }] }, finishReason: 'STOP' }] });
