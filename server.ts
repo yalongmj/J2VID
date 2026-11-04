@@ -1,3 +1,4 @@
+import { assertCompleteScenes, buildAttemptChain, markUnusable, publicTrail, runAttemptChain, type Failure } from './lib/model-fallback.js';
 import { DEFAULT_MODEL_ID, GEMINI_FALLBACK_MODEL_ID, DEFAULT_OPENROUTER_MODEL_ID, OPENROUTER_FALLBACK_MODEL_ID, GEMINI_MODEL_IDS, OPENROUTER_MODEL_IDS, resolveModelSelection } from './src/data/models.js';
 import { apiHealth } from './lib/api-health.js';
 import express from "express";
@@ -6,7 +7,7 @@ import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
 import { transcribeDeepgram } from './lib/deepgram.js';
 import { SCENE_GUIDELINES, SUBTITLE_GUIDELINES, formatBackgroundContext } from './lib/annotation-guidelines.js';
-import { getApiKeys, withApiKeyFallback, type KeyPurpose } from './lib/api-keys.js';
+import { classifyError, KeyCooldown, getApiKeys, withApiKeyFallback, type KeyPurpose } from './lib/api-keys.js';
 import { selectAudioModel, parseAudioInput, normalizeSubtitles } from './lib/subtitles.js';
 import { accessApp, requireSession } from './lib/access.js';
 
@@ -37,6 +38,12 @@ function sanitizeModel(input?: string, defaultModel = DEFAULT_MODEL_ID): string 
   return resolveModelSelection(input || defaultModel);
 }
 
+function safeMessage(error:any) {
+  let message = String(error?.message || '');
+  for (const purpose of ['gemini','openrouter','audio','deepgram'] as const)
+    for (const key of getApiKeys(purpose)) message=message.split(key).join('[redacted]');
+  return message;
+}
 function isQuotaError(err: any): boolean {
   const msg = (err?.message || "").toLowerCase();
   const status = err?.status || err?.statusCode || 0;
@@ -80,13 +87,13 @@ async function callOpenRouterOnce({
   systemPrompt,
   userPrompt,
   images = [],
-  apiKey
+  apiKey, timeout
 }: {
   model: string;
   systemPrompt?: string;
   userPrompt: string;
   images?: Array<{ mimeType?: string; base64: string }>;
-  apiKey: string;
+  apiKey: string; timeout:number;
 }) {
   const contentParts: any[] = [];
 
@@ -120,7 +127,7 @@ async function callOpenRouterOnce({
 
   const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
-    signal: AbortSignal.timeout(120000),
+    signal: AbortSignal.timeout(timeout),
     headers: {
       Authorization: `Bearer ${apiKey}`,
       "HTTP-Referer": process.env.APP_URL || "https://ai.studio",
@@ -157,34 +164,45 @@ async function callOpenRouterOnce({
   return rawText;
 }
 
-async function callOpenRouter(args: Parameters<typeof callOpenRouterOnce>[0] & { autoFallback?: boolean }) {
-  return withApiKeyFallback(getApiKeys('openrouter'), apiKey =>
-    callOpenRouterOnce({ ...args, apiKey }), args.autoFallback !== false);
-}
-
-async function runGeminiWithFallback(
-  ai: GoogleGenAI,
-  params: any,
-  requestedModel: string,
-  autoFallback = true,
-  purpose: KeyPurpose = 'gemini'
-) {
+const cooldown = new KeyCooldown();
+export async function runModelChain({requestedModel, autoFallback=true, purpose='gemini', geminiParams, openRouter, accept}: {
+  requestedModel:string; autoFallback?:boolean; purpose?:KeyPurpose; geminiParams:any;
+  openRouter?:Omit<Parameters<typeof callOpenRouterOnce>[0], 'apiKey'|'model'|'timeout'>;
+  accept:(data:any)=>unknown;
+}) {
   const keys = getApiKeys(purpose);
-  const execute = (model: string) => withApiKeyFallback(keys, apiKey => {
-    const client = apiKey === keys[0] ? ai : new GoogleGenAI({ apiKey,
-      httpOptions: { timeout: 120000 } });
-    return client.models.generateContent({ ...params, model });
-  }, autoFallback);
+  const routerKeys = getApiKeys('openrouter');
+  const chain = buildAttemptChain(requestedModel,{autoFallback,hasGemini:!!keys.length,hasOpenRouter:!!openRouter && !!routerKeys.length});
+  const budgetMs = Number(process.env.FALLBACK_TIME_BUDGET_MS) || 150000;
+  const deadline = Date.now()+budgetMs;
+  const trail:Failure[]=[];
   try {
-    const response = await execute(requestedModel);
-    return { response, modelUsed: requestedModel, fellBack: false, originalModel: requestedModel };
-  } catch (err: any) {
-    const status = Number(err?.status || err?.statusCode || err?.code);
-    if (!autoFallback || !(isQuotaError(err) || [404, 502, 503, 504].includes(status))) throw err;
-    const fallbackModel = requestedModel === GEMINI_FALLBACK_MODEL_ID
-      ? DEFAULT_MODEL_ID : GEMINI_FALLBACK_MODEL_ID;
-    const response = await execute(fallbackModel);
-    return { response, modelUsed: fallbackModel, fellBack: true, originalModel: requestedModel };
+    return await runAttemptChain(chain, async step => {
+      let reason = 'fatal';
+      const data = await withApiKeyFallback(step.provider==='gemini'?keys:routerKeys, async apiKey=>{
+        const timeout = Math.min(Number(process.env.PROVIDER_TIMEOUT_MS)||120000, deadline-Date.now());
+        if (timeout<=0) throw Object.assign(new Error('Fallback time budget exhausted'),{budgetExhausted:true});
+        try {
+          const raw = step.provider==='gemini'
+            ? (await new GoogleGenAI({apiKey,httpOptions:{timeout}}).models.generateContent({...geminiParams,model:step.model})).text
+            : await callOpenRouterOnce({...openRouter!,...step,apiKey,timeout});
+          try {
+            const parsed=extractJson(raw || '');
+            accept(parsed);
+            return parsed;
+          } catch(error) { throw markUnusable(error); }
+        } catch(error) { reason=classifyError(error); throw error; }
+      },autoFallback,{cooldown,scope:step.provider+':'+step.model,onAttempt:({ok,keyIndex,status})=>{
+        if (!ok) {
+          const failure={...step,keyIndex,status,reason};
+          trail.push(failure);
+          console.warn('Provider attempt failed',failure);
+        }
+      }});
+      return {data,modelUsed:step.model,provider:step.provider,fellBack:step.model!==requestedModel,originalModel:requestedModel,trail:publicTrail(trail)};
+    },{budgetMs});
+  } catch(error) {
+    throw Object.assign(error as Error,{fallbackTrail:publicTrail(trail)});
   }
 }
 
@@ -328,109 +346,6 @@ Produce strictly structured JSON conforming to the following format:
       scenesText = customPrompt || `Analyze the footage/scenes (duration: ${durationFormatted}). Return structured JSON.`;
     }
 
-    // Determine provider execution: OpenRouter vs Google Gemini
-    const useOpenRouter =
-      isOpenRouterModel(targetModel) ||
-      (!geminiKey && Boolean(openRouterKey));
-
-    if (useOpenRouter) {
-      if (!openRouterKey) {
-        if (geminiKey) {
-          targetModel = DEFAULT_MODEL_ID;
-        } else {
-          return res.status(500).json({
-            error: `OPENROUTER_API_KEY is required to use model '${targetModel}'. Please configure OPENROUTER_API_KEY in your environment variables.`,
-            keyMissing: true
-          });
-        }
-      } else {
-        // Effective model on OpenRouter
-        let effectiveOpenRouterModel = isOpenRouterModel(targetModel)
-          ? targetModel
-          : DEFAULT_OPENROUTER_MODEL_ID;
-
-        try {
-          const rawText = await callOpenRouter({
-            model: effectiveOpenRouterModel,
-            systemPrompt: systemInstruction,
-            userPrompt: scenesText,
-            images: openRouterImages,
-            apiKey: openRouterKey,
-            autoFallback
-          });
-
-          const parsedData = extractJson(rawText);
-
-          if (parsedData.scenes && Array.isArray(parsedData.scenes)) {
-            parsedData.scenes = parsedData.scenes.map((sc: any, i: number) => ({
-              ...sc,
-              start_time: scenesInput?.find((input: any) => input.scene_id === sc.scene_id)?.start_time || sc.start_time,
-              end_time: scenesInput?.find((input: any) => input.scene_id === sc.scene_id)?.end_time || sc.end_time
-            }));
-          }
-
-          if (!parsedData.subtitles) {
-            parsedData.subtitles = [];
-          }
-
-          parsedData._modelUsed = effectiveOpenRouterModel;
-          parsedData._provider = "openrouter";
-          if (effectiveOpenRouterModel !== targetModel) {
-            parsedData._fellBackFrom = targetModel;
-          }
-
-          if (req.body.audioData) {
-            parsedData.subtitles = audioResult.subtitles;
-            parsedData._audioModelUsed = audioResult._modelUsed;
-            parsedData._audioProvider = audioResult._provider;
-            parsedData._audioWarnings = audioResult._warnings || [];
-          } else {
-            parsedData.subtitles = normalizeSubtitles(parsedData.subtitles || []);
-          }
-          return res.json(parsedData);
-        } catch (orErr: any) {
-          console.warn("[OpenRouter Error]", orErr.message);
-          if (autoFallback && geminiKey) {
-            console.log("Failing over from OpenRouter to Google Gemini...");
-            targetModel = DEFAULT_MODEL_ID;
-            // Fall through to Gemini execution below
-          } else if (autoFallback && isQuotaError(orErr) && effectiveOpenRouterModel !== OPENROUTER_FALLBACK_MODEL_ID) {
-            // Retry with the current free router instead of a stale community model.
-            const fallbackOrModel = OPENROUTER_FALLBACK_MODEL_ID;
-            const rawText = await callOpenRouter({
-              model: fallbackOrModel,
-              systemPrompt: systemInstruction,
-              userPrompt: scenesText,
-              images: openRouterImages,
-              apiKey: openRouterKey,
-              autoFallback
-            });
-            const parsedData = extractJson(rawText);
-            parsedData._modelUsed = fallbackOrModel;
-            parsedData._fellBackFrom = effectiveOpenRouterModel;
-            parsedData._provider = "openrouter";
-            if (req.body.audioData) {
-            parsedData.subtitles = audioResult.subtitles;
-            parsedData._audioModelUsed = audioResult._modelUsed;
-            parsedData._audioProvider = audioResult._provider;
-            parsedData._audioWarnings = audioResult._warnings || [];
-          } else {
-            parsedData.subtitles = normalizeSubtitles(parsedData.subtitles || []);
-          }
-          return res.json(parsedData);
-          } else {
-            throw orErr;
-          }
-        }
-      }
-    }
-
-    // Direct Google Gemini Execution
-    const ai = new GoogleGenAI({
-      apiKey: geminiKey,
-      httpOptions: { timeout: 120000 }
-    });
-
     const parts: any[] = [];
 
     if (Array.isArray(scenesInput) && scenesInput.length > 0) {
@@ -503,9 +418,7 @@ Video Metadata:
       parts.push({ text: userPrompt });
     }
 
-    const { response, modelUsed, fellBack, originalModel } = await runGeminiWithFallback(
-      ai,
-      {
+    const { data:parsedData, provider, trail, modelUsed, fellBack, originalModel } = await runModelChain({ requestedModel:targetModel, autoFallback, openRouter:{systemPrompt:systemInstruction,userPrompt:scenesText,images:openRouterImages}, accept:data=>{ if (Array.isArray(scenesInput)) assertCompleteScenes(data,scenesInput); else if (!data || typeof data!=='object' || Array.isArray(data) || !Object.keys(data).length) throw new Error('Empty annotation'); }, geminiParams:{
         contents: { parts },
         config: {
           systemInstruction,
@@ -555,13 +468,9 @@ Video Metadata:
             required: ["video_duration", "suitability", "scenes"]
           }
         }
-      },
-      targetModel,
-      autoFallback
-    );
+      }});
 
-    const responseText = response.text || "";
-    const parsedData = JSON.parse(responseText);
+
 
     if (parsedData.scenes && Array.isArray(parsedData.scenes)) {
       parsedData.scenes = parsedData.scenes.map((sc: any, i: number) => ({
@@ -576,7 +485,8 @@ Video Metadata:
     }
 
     parsedData._modelUsed = modelUsed;
-    parsedData._provider = "gemini";
+    parsedData._provider = provider;
+    parsedData._fallbackTrail = trail;
     if (fellBack) {
       parsedData._fellBackFrom = originalModel;
     }
@@ -591,10 +501,10 @@ Video Metadata:
           }
           return res.json(parsedData);
   } catch (error: any) {
-    console.error("Error in /api/annotate-video:", error);
     const quotaExhausted = isQuotaError(error);
     return res.status(quotaExhausted ? 429 : 500).json({
-      error: error.message || "Failed to process video annotation.",
+      fallbackTrail:publicTrail(error.fallbackTrail),
+      error: safeMessage(error) || "Failed to process video annotation.",
       isQuotaExhausted: quotaExhausted,
       modelUsed: targetModel,
       suggestedFallback: targetModel === GEMINI_FALLBACK_MODEL_ID ? DEFAULT_MODEL_ID : GEMINI_FALLBACK_MODEL_ID
@@ -653,37 +563,6 @@ apiRouter.post(["/revise-scene", "/api/revise-scene"], async (req, res) => {
     revisionPrompt += `3. Adhere strictly to factual video annotation guidelines (objective visual description, no speculation, clear subject & background details).\n`;
     revisionPrompt += `4. Return ONLY a JSON object with key "revised_description": {"revised_description": "..."}\n`;
 
-    const useOpenRouter =
-      isOpenRouterModel(targetModel) ||
-      (!geminiKey && Boolean(openRouterKey));
-
-    if (useOpenRouter && openRouterKey) {
-      const effectiveOrModel = isOpenRouterModel(targetModel)
-        ? targetModel
-        : DEFAULT_OPENROUTER_MODEL_ID;
-
-      const raw = await callOpenRouter({
-        model: effectiveOrModel,
-        systemPrompt: "You are an expert video annotation rewriting agent. Apply user feedback precisely and return valid JSON.",
-        userPrompt: revisionPrompt,
-        images,
-        apiKey: openRouterKey,
-        autoFallback
-      });
-      const parsed = extractJson(raw);
-      return res.json({
-        revised_description: parsed.revised_description || currentDescription,
-        _modelUsed: effectiveOrModel,
-        _provider: "openrouter"
-      });
-    }
-
-    // Otherwise use Google Gemini
-    const ai = new GoogleGenAI({
-      apiKey: geminiKey,
-      httpOptions: { timeout: 120000 }
-    });
-
     const parts: any[] = [];
     if (images.length > 0) {
       parts.push({ text: `[SCENE #${sceneId} SNAPSHOT IMAGE]` });
@@ -693,9 +572,7 @@ apiRouter.post(["/revise-scene", "/api/revise-scene"], async (req, res) => {
     }
     parts.push({ text: revisionPrompt });
 
-    const { response, modelUsed, fellBack, originalModel } = await runGeminiWithFallback(
-      ai,
-      {
+    const { data:parsedData, provider, trail, modelUsed, fellBack, originalModel } = await runModelChain({ requestedModel:targetModel, autoFallback, openRouter:{userPrompt:revisionPrompt,images}, accept:data=>{if(typeof data?.revised_description!=='string' || !data.revised_description.trim()) throw new Error('Empty revision');}, geminiParams:{
         contents: { parts },
         config: {
           responseMimeType: "application/json",
@@ -707,23 +584,20 @@ apiRouter.post(["/revise-scene", "/api/revise-scene"], async (req, res) => {
             required: ["revised_description"]
           }
         }
-      },
-      targetModel,
-      autoFallback
-    );
+      }});
 
-    const parsed = JSON.parse(response.text || "{}");
+
     return res.json({
-      revised_description: parsed.revised_description || currentDescription,
+      revised_description: parsedData.revised_description,
       _modelUsed: modelUsed,
-      _provider: "gemini",
+      _provider: provider, _fallbackTrail:trail,
       _fellBackFrom: fellBack ? originalModel : undefined
     });
   } catch (err: any) {
-    console.error("Error in /api/revise-scene:", err);
     const quotaExhausted = isQuotaError(err);
     return res.status(quotaExhausted ? 429 : 500).json({
-      error: err.message || "Failed to revise scene description.",
+      fallbackTrail:publicTrail(err.fallbackTrail),
+      error: safeMessage(err) || "Failed to revise scene description.",
       isQuotaExhausted: quotaExhausted,
       modelUsed: targetModel,
       suggestedFallback: targetModel === GEMINI_FALLBACK_MODEL_ID ? DEFAULT_MODEL_ID : GEMINI_FALLBACK_MODEL_ID
@@ -739,11 +613,6 @@ export async function transcribeAudio(audioData: unknown, audioMimeType?: string
     const apiKey = getApiKeys('audio')[0] || '';
     if (!apiKey) throw new Error('Audio subtitles require GEMINI_AUDIO_API_KEY or GEMINI_API_KEY. The OpenRouter key handles scene descriptions only.');
     const targetModel = selectAudioModel(process.env.GEMINI_AUDIO_MODEL || requestedModel);
-    const ai = new GoogleGenAI({
-      apiKey,
-      httpOptions: { timeout: 120000 }
-    });
-
     const { data: base64Audio, mimeType } = parseAudioInput(audioData, audioMimeType);
 
     const parts: any[] = [];
@@ -762,9 +631,7 @@ Return JSON with a subtitles array. Each item requires subtitle_id, start_time, 
 type (Spoken words, Music, Sound effect, Ambient sound, Vocal sound or Other), and text.`
     });
 
-    const { response, modelUsed, fellBack, originalModel } = await runGeminiWithFallback(
-      ai,
-      {
+    const { data:parsedData, provider, trail, modelUsed, fellBack, originalModel } = await runModelChain({ requestedModel:targetModel, autoFallback, purpose:'audio', accept:data=>{data.subtitles=normalizeSubtitles(data.subtitles);}, geminiParams:{
         contents: { parts },
         config: {
           systemInstruction: SUBTITLE_GUIDELINES,
@@ -790,15 +657,11 @@ type (Spoken words, Music, Sound effect, Ambient sound, Vocal sound or Other), a
             required: ["subtitles"]
           }
         }
-      },
-      targetModel,
-      autoFallback,
-      'audio'
-    );
+      }});
 
-    const parsedData = extractJson(response.text || "{}");
-    parsedData.subtitles = normalizeSubtitles(parsedData.subtitles);
-    parsedData._provider = "gemini";
+
+    parsedData._provider = provider;
+    parsedData._fallbackTrail = trail;
     parsedData._modelUsed = modelUsed;
     if (fellBack) {
       parsedData._fellBackFrom = originalModel;
@@ -822,10 +685,10 @@ apiRouter.post(["/transcribe-audio", "/api/transcribe-audio"], async (req, res) 
     const parsedData = await transcribeAudio(audioData, audioMimeType, targetModel, autoFallback, req.body.subtitleProvider);
     return res.json(parsedData);
   } catch (err: any) {
-    console.error("Error in /api/transcribe-audio:", err);
     const quotaExhausted = isQuotaError(err);
     return res.status(err.status === 400 ? 400 : err.status === 503 ? 503 : quotaExhausted ? 429 : 500).json({
-      error: err.message || "Failed to transcribe audio file.",
+      fallbackTrail:publicTrail(err.fallbackTrail),
+      error: safeMessage(err) || "Failed to transcribe audio file.",
       isQuotaExhausted: quotaExhausted,
       modelUsed: targetModel,
       suggestedFallback: deepgram ? undefined : targetModel === GEMINI_FALLBACK_MODEL_ID ? DEFAULT_MODEL_ID : GEMINI_FALLBACK_MODEL_ID

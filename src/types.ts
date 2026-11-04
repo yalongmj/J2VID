@@ -60,6 +60,7 @@ export interface VideoAnnotationResult {
   subtitles: SubtitleAnnotation[];
   _modelUsed?: string;
   _fellBackFrom?: string;
+  _fallbackTrail?: Array<{provider:string;model:string;keyIndex:number;status:number;reason:string}>;
 }
 
 export interface AgentWorkflowStep {

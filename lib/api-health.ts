@@ -5,6 +5,7 @@ export function apiHealth() {
   const hasGeminiKey = getApiKeys('gemini').length > 0;
   const hasOpenRouterKey = getApiKeys('openrouter').length > 0;
   return {
+    keyCounts:Object.fromEntries((['gemini','openrouter','audio','deepgram'] as const).map(p=>[p,getApiKeys(p).length])),
     status: 'ok', hasApiKey: hasGeminiKey || hasOpenRouterKey,
     keyConfigured: hasGeminiKey || hasOpenRouterKey,
     hasGeminiKey, hasOpenRouterKey,
